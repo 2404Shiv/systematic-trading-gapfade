@@ -1,0 +1,29 @@
+# build outputs
+*.o
+*.obj
+*.out
+*.exe
+*.a
+*.so
+*.dll
+*.dylib
+
+# binaries
+gap_fade
+gapfade
+
+# debug/profiler
+*.dSYM/
+*.gcno
+*.gcda
+*.gcov
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# data & results (keep small samples only)
+data/*.csv
+!data/README.md
+results/
