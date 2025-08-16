@@ -456,7 +456,9 @@ pnl_keys.push_back(portfolio_r);
 equity.push_back(cap);
 month_keys.push_back(M);
 year_keys.push_back(Y);
-wday_keys.push_back(weekday(Y,M,D));
+    wday_keys.push_back(weekday(Y,M,D));
+    // End of daily loop
+    }
 
     // Summary stats
     double tot = (cap - start_cap)/start_cap * 100.0;
