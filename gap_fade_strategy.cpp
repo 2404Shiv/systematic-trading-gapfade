@@ -466,11 +466,16 @@ year_keys.push_back(Y);
     double var=0; for (double r: daily_ret){ double d=r-mu; var+=d*d; }
     var/=std::max<size_t>(1,daily_ret.size());
     double sd = std::sqrt(var);
-    int wins=0; for (double r: daily_ret) if (r>0) ++wins;
-    auto [dd, sIdx, eIdx] = max_dd(equity);
-    double v95 = var95(daily_ret);
-    double cv95 = cvar95(daily_ret);
+int wins=0; for (double r: daily_ret) if (r>0) ++wins;
+auto [dd, sIdx, eIdx] = max_dd(equity);
+double v95 = var95(daily_ret);
+double cv95 = cvar95(daily_ret);
 
+Metrics metrics = {
+    tot, mu, sd, sharpe(daily_ret), sortino(daily_ret),
+    dd, v95, cv95,
+    (wins * 100.0) / std::max<size_t>(1, daily_ret.size())
+};
     // Aggregations
     auto agg = [&](const vector<int>& keys){
         unordered_map<int,double> m; for (size_t i=0;i<keys.size();++i) m[keys[i]]+=pnl_keys[i]; return m;
@@ -497,8 +502,11 @@ year_keys.push_back(Y);
     for (auto& kv: monthly) cout<<"Month "<<kv.first<<": "<<kv.second*100<<" %\n";
     cout<<"\nYearly PnL (% of capital):\n";
     for (auto& kv: yearly) cout<<"Year "<<kv.first<<": "<<kv.second*100<<" %\n";
-    static const char* wdN[]={"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
-    cout<<"\nWeekday PnL (% of capital):\n";
-    for (auto& kv: wday) if (kv.first>=0 && kv.first<7) cout<<wdN[kv.first]<<": "<<kv.second*100<<" %\n";
-    return 0;
-}
+    static const char* wdN[] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
+cout << "\nWeekday PnL (% of capital):\n";
+    for (auto& kv : wday) 
+        if (kv.first >= 0 && kv.first < 7) 
+            cout << wdN[kv.first] << ": " << kv.second * 100 << "%\n";
+
+    return 0;   // single return
+}               // single brace closes main
