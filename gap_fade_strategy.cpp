@@ -56,419 +56,604 @@
 
 // gap_fade_strategy.cpp  — market-neutral, cross-sectional gap-fade
 
-// gap_fade_strategy.cpp  — market-neutral, cross-sectional gap-fade
+/*
+ Systematic Gap-Fade Strategy (C++)
+ 
+ - Multi-asset daily backtest for gap-fade (fade gap-ups, buy gap-downs).
+ - Market/dollar-neutral portfolio construction with gross and per-name caps.
+ - Transaction costs: spread bps + market impact bps per %ADV (round trip).
+ - Signal quality gating via z-scored gaps (z_min/z_max) using rolling O->C vol.
+ - Trade selection by top-|z| fraction per day.
+ - Per-name loss cap (stop_bps) on daily contribution.
+ - Portfolio-level volatility targeting (EWMA) to target annual vol.
+ - Optional beta-neutral adjustment vs. benchmark (rolling OLS on daily series).
+ - Robust CSV ingest (Yahoo/Alpha/Vendor-like headers).
+ - Full analytics: Sharpe, Sortino, MaxDD, VaR/CVaR, win rate, monthly/yearly/weekday PnL.
+ - Optional date range filter and CSV dumps for daily returns & equity.
+
+ Build:  g++ -O3 -std=c++17 gap_fade_strategy.cpp -o gap_fade
+*/
+
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <cstddef>
-#include <cstdio>
+#include <cstdint>
 #include <cstdlib>
-#include <string>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <numeric>
+#include <optional>
 #include <set>
 #include <sstream>
+#include <string>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
-using std::cerr;
-using std::cout;
-using std::endl;
-using std::ifstream;
-using std::map;
-using std::set;
-using std::string;
-using std::stringstream;
-using std::unordered_map;
-using std::vector;
 
-struct PriceRecord {
-  int y{}, m{}, d{};
-  double open{}, high{}, low{}, close{};
-  long long volume{};
+using namespace std;
+
+struct Bar {
+    int y{}, m{}, d{}, date{};     // yyyymmdd
+    double open{}, high{}, low{}, close{}, adjclose{};
+    double volume{};
 };
 
-static bool parse_date(const string& s, int& y, int& m, int& d) {
-  if (s.size() < 10) return false;
-  y = std::stoi(s.substr(0, 4));
-  m = std::stoi(s.substr(5, 2));
-  d = std::stoi(s.substr(8, 2));
-  return true;
-}
+struct PriceSeries {
+    string sym;
+    vector<Bar> bars;              // sorted ascending by date
+    unordered_map<int, size_t> idx;// date -> index
+};
 
-static string basename_noext(const string& path) {
-  size_t sl = path.find_last_of("/\\");
-  string base = (sl == string::npos) ? path : path.substr(sl + 1);
-  size_t dot = base.find_last_of('.');
-  if (dot != string::npos) base = base.substr(0, dot);
-  return base;
-}
+// ---------- utils ----------
+static inline int yyyymmdd(int y, int m, int d) { return y*10000 + m*100 + d; }
 
-static void read_csv(const string& filename, vector<PriceRecord>& out) {
-  ifstream f(filename);
-  if (!f.is_open()) { cerr << "Cannot open " << filename << endl; return; }
-  string line;
-  bool first = true;
-  while (std::getline(f, line)) {
-    if (line.empty()) continue;
-    if (first) {
-      first = false;
-      if (!line.empty() && !std::isdigit(line[0])) continue;
+static inline optional<tuple<int,int,int>> parse_ymd(const string& s) {
+    if (s.size() < 8) return nullopt;
+    // support "YYYY-MM-DD" or "YYYY/MM/DD" or "YYYYMMDD"
+    if (s.size() >= 10 && (s[4]=='-' || s[4]=='/') && (s[7]=='-' || s[7]=='/')) {
+        int y = stoi(s.substr(0,4));
+        int m = stoi(s.substr(5,2));
+        int d = stoi(s.substr(8,2));
+        return {{y,m,d}};
+    } else if (s.size() >= 8) {
+        int y = stoi(s.substr(0,4));
+        int m = stoi(s.substr(4,2));
+        int d = stoi(s.substr(6,2));
+        return {{y,m,d}};
     }
-    stringstream ss(line);
-    string ds, op, hi, lo, cl, adj, vol;
-    if (!std::getline(ss, ds, ',')) continue;
-    std::getline(ss, op, ',');
-    std::getline(ss, hi, ',');
-    std::getline(ss, lo, ',');
-    std::getline(ss, cl, ',');
-    std::getline(ss, adj, ',');
-    std::getline(ss, vol, ',');
-    PriceRecord r;
-    int ry, rm, rd;
-    if (!parse_date(ds, ry, rm, rd)) continue;
-    r.y = ry; r.m = rm; r.d = rd;
-    try {
-      r.open = std::stod(op);
-      r.high = std::stod(hi);
-      r.low  = std::stod(lo);
-      r.close = std::stod(cl);
-      r.volume = vol.empty() ? 0 : std::stoll(vol);
-    } catch(...) { continue; }
-    out.push_back(r);
-  }
+    return nullopt;
 }
 
-static double sharpe(const vector<double>& r) {
-  if (r.empty()) return 0.0;
-  double mu = 0.0; for (double x : r) mu += x; mu /= r.size();
-  double v = 0.0;  for (double x : r) { double d = x - mu; v += d*d; } v /= r.size();
-  double sd = std::sqrt(v);
-  return (sd == 0.0) ? 0.0 : (mu / sd) * std::sqrt(252.0);
+static int weekday(int y, int m, int d) {
+    if (m < 3) { m += 12; --y; }
+    int K = y % 100, J = y / 100;
+    int h = (d + (13*(m+1))/5 + K + K/4 + J/4 + 5*J) % 7; // 0=Sat
+    int w = (h + 6) % 7; // 0=Sun..6=Sat -> convert to 0=Mon..6=Sun
+    // map: Sun(0)->6, Mon(1)->0 ... Sat(6)->5
+    static int map7[7] = {6,0,1,2,3,4,5};
+    return map7[w];
 }
 
-static double sortino(const vector<double>& r) {
-  if (r.empty()) return 0.0;
-  double mu = 0.0; for (double x : r) mu += x; mu /= r.size();
-  double down = 0.0; int n = 0;
-  for (double x : r) if (x < 0.0) { down += x*x; ++n; }
-  if (n == 0) return 0.0;
-  double dd = std::sqrt(down / n);
-  return (dd == 0.0) ? 0.0 : (mu / dd) * std::sqrt(252.0);
+static double mean(const vector<double>& v) {
+    if (v.empty()) return 0.0;
+    return accumulate(v.begin(), v.end(), 0.0) / (double)v.size();
 }
 
-static std::tuple<double, std::size_t, std::size_t> max_dd(const vector<double>& eq) {
-  if (eq.empty()) return {0.0, 0, 0};
-  double peak = eq[0], mdd = 0.0;
-  std::size_t s = 0, e = 0, p = 0;
-  for (std::size_t i = 1; i < eq.size(); ++i) {
-    if (eq[i] > peak) { peak = eq[i]; p = i; }
-    double d = (eq[i] - peak) / peak;
-    if (d < mdd) { mdd = d; s = p; e = i; }
-  }
-  return {mdd, s, e};
+static double variance(const vector<double>& v, double mu) {
+    if (v.empty()) return 0.0;
+    double s = 0.0;
+    for (double x : v) { double d = x - mu; s += d*d; }
+    return s / (double)v.size();
 }
 
 static double percentile(vector<double> v, double q) {
-  if (v.empty()) return 0.0;
-  std::sort(v.begin(), v.end());
-  double pos = q * (v.size() - 1);
-  std::size_t i = (std::size_t)std::floor(pos);
-  std::size_t j = std::min(v.size() - 1, i + 1);
-  double w = pos - i;
-  return v[i] * (1 - w) + v[j] * w;
+    if (v.empty()) return 0.0;
+    sort(v.begin(), v.end());
+    double idx = q * (v.size()-1);
+    size_t i = (size_t)floor(idx);
+    size_t j = min(v.size()-1, i+1);
+    double w = idx - (double)i;
+    return (1.0 - w) * v[i] + w * v[j];
 }
 
-static double var95(const vector<double>& r) {
-  return percentile(r, 0.05);
+static double var95(const vector<double>& v)  { return percentile(v, 0.05); }
+static double cvar95(const vector<double>& v) {
+    if (v.empty()) return 0.0;
+    double v95 = var95(v);
+    double sum=0.0; int n=0;
+    for (double x : v) if (x <= v95) { sum += x; ++n; }
+    return n ? sum / (double)n : 0.0;
 }
 
-static double cvar95(const vector<double>& r) {
-  if (r.empty()) return 0.0;
-  double v = var95(r);
-  double sum = 0.0; int n = 0;
-  for (double x : r) if (x <= v) { sum += x; ++n; }
-  return (n == 0) ? 0.0 : (sum / n);
+static tuple<double,size_t,size_t> max_drawdown_from_equity(const vector<double>& eq) {
+    if (eq.empty()) return {0.0,0,0};
+    double peak = eq.front(), worst = 0.0;
+    size_t s=0,e=0,p=0;
+    for (size_t i=0;i<eq.size();++i) {
+        if (eq[i] > peak) { peak = eq[i]; p = i; }
+        double dd = (peak - eq[i]) / max(peak, 1e-12);
+        if (dd > worst) { worst = dd; s = p; e = i; }
+    }
+    return {worst, s, e};
 }
 
-static int yyyymmdd(int y, int m, int d) { return y*10000 + m*100 + d; }
-static int weekday(int y, int m, int d) {
-  if (m < 3) { m += 12; --y; }
-  int K = y % 100, J = y / 100;
-  int h = (d + (13*(m+1))/5 + K + K/4 + J/4 + 5*J) % 7;
-  return (h + 5) % 7;
+static double sharpe(const vector<double>& r) {
+    if (r.empty()) return 0.0;
+    double mu = mean(r), var = variance(r, mu);
+    double sd = sqrt(max(var, 0.0));
+    return (sd > 0.0) ? (mu / sd) * sqrt(252.0) : 0.0;
+}
+static double sortino(const vector<double>& r) {
+    if (r.empty()) return 0.0;
+    double mu = mean(r);
+    double down=0.0; int n=0;
+    for (double x : r) if (x < 0.0) { down += x*x; ++n; }
+    if (!n) return 0.0;
+    double dd = sqrt(down/(double)n);
+    return (dd>0.0) ? (mu/dd)*sqrt(252.0) : 0.0;
 }
 
-struct Metrics {
-  double total_return{};
-  double mean{}, stdev{}, sharpe{}, sortino{};
-  double max_drawdown{};
-  double VaR95{}, CVaR95{};
-  double win_rate{};
+// ---------- CSV ingest ----------
+struct CsvMap {
+    int date=-1, open=-1, high=-1, low=-1, close=-1, adj=-1, vol=-1;
+};
+
+static CsvMap detect_header_indices(const string& header) {
+    CsvMap m;
+    vector<string> cols;
+    string col, tmp = header;
+    stringstream ss(tmp);
+    while (getline(ss, col, ',')) {
+        for (char& c : col) c = (char)tolower(c);
+        // strip spaces
+        col.erase(remove_if(col.begin(), col.end(), ::isspace), col.end());
+        cols.push_back(col);
+    }
+    auto pick = [&](const vector<string>& cands)->int{
+        for (int i=0;i<(int)cols.size();++i)
+            for (auto& name: cands) if (cols[i]==name) return i;
+        return -1;
+    };
+    m.date  = pick({"date","day"});
+    m.open  = pick({"open","opn"});
+    m.high  = pick({"high","hi"});
+    m.low   = pick({"low","lo"});
+    m.close = pick({"close","cls","closingprice"});
+    m.adj   = pick({"adjclose","adjustedclose","adj"});
+    m.vol   = pick({"volume","vol","volumn"});
+    return m;
+}
+
+static PriceSeries load_csv_series(const string& path) {
+    PriceSeries ps;
+    // symbol from path
+    string sym = path;
+    size_t p = sym.find_last_of("/\\");
+    if (p != string::npos) sym = sym.substr(p+1);
+    if (sym.size() > 4 && sym.substr(sym.size()-4)==".csv") sym = sym.substr(0, sym.size()-4);
+    ps.sym = sym;
+
+    ifstream f(path);
+    if (!f.is_open()) { cerr<<"Cannot open "<<path<<"\n"; return ps; }
+    string line;
+    if (!getline(f, line)) return ps;
+    CsvMap map = detect_header_indices(line);
+
+    vector<Bar> bars;
+    bars.reserve(4096);
+    while (getline(f, line)) {
+        if (line.empty()) continue;
+        vector<string> t;
+        string cell; stringstream ss(line);
+        while (getline(ss, cell, ',')) t.push_back(cell);
+        auto get = [&](int idx)->string {
+            if (idx < 0 || idx >= (int)t.size()) return string();
+            return t[idx];
+        };
+        string dstr = get(map.date);
+        if (dstr.empty()) continue;
+        auto ymd = parse_ymd(dstr);
+        if (!ymd) continue;
+        auto [y,m,d] = *ymd;
+        Bar b; b.y=y; b.m=m; b.d=d; b.date = yyyymmdd(y,m,d);
+        try {
+            b.open  = stod(get(map.open));
+            b.high  = stod(get(map.high));
+            b.low   = stod(get(map.low));
+            b.close = stod(get(map.close));
+        } catch(...) { continue; }
+        string adj = get(map.adj);
+        if (!adj.empty()) { try { b.adjclose = stod(adj); } catch(...){} }
+        string vs = get(map.vol);
+        if (!vs.empty()) { try { b.volume = stod(vs); } catch(...){} }
+        bars.push_back(b);
+    }
+    sort(bars.begin(), bars.end(), [](const Bar& a, const Bar& b){ return a.date < b.date; });
+    ps.bars = std::move(bars);
+    ps.idx.reserve(ps.bars.size());
+    for (size_t i=0;i<ps.bars.size();++i) ps.idx[ps.bars[i].date] = i;
+    return ps;
+}
+
+// ---------- main ----------
+struct Item {
+    string sym;
+    double ret;        // signed O->C ret (fade direction applied later via dir)
+    double adv_pct;    // frac ADV consumed proxy (1/prev_volume)
+    int    dir;        // +1 for long, -1 for short
+    double vol;        // rolling O->C stdev
+    double z;          // gap z-score
 };
 
 int main(int argc, char** argv) {
-  if (argc < 2) {
-    cerr<<"Usage: "<<argv[0]<<" <csv1> [csv2 ...] "
-        <<"[--gap_threshold=bps] [--spread=bps] [--impact=bps_per_pctADV] "
-        <<"[--gross=1.0] [--max_weight=0.05] [--lookback=20]\n";
-    return 1;
-  }
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
 
-  double gap_bps = 20.0, spread_bps = 1.0, impact_bps_per_pctADV = 0.5;
-  double gross = 1.0, max_w = 0.05; int lookback = 20;
-  bool beta_neutral = true; int beta_lookback = 60;
-  string benchmark_path = ""; string benchmark_sym = "SPY";
-
-  vector<string> files;
-  for (int i = 1; i < argc; ++i) {
-    string a = argv[i];
-    if (a.rfind("--", 0) == 0) {
-      bool handled = false;
-      if (a.rfind("--gap_threshold=", 0) == 0) { gap_bps = std::stod(a.substr(16)); handled = true; }
-      else if (a.rfind("--spread=", 0) == 0) { spread_bps = std::stod(a.substr(9)); handled = true; }
-      else if (a.rfind("--impact=", 0) == 0) { impact_bps_per_pctADV = std::stod(a.substr(9)); handled = true; }
-      else if (a.rfind("--gross=", 0) == 0) { gross = std::stod(a.substr(8)); handled = true; }
-      else if (a.rfind("--max_weight=", 0) == 0) { max_w = std::stod(a.substr(13)); handled = true; }
-      else if (a.rfind("--lookback=", 0) == 0) { lookback = std::stoi(a.substr(11)); handled = true; }
-      else if (a.rfind("--beta_neutral=", 0) == 0) { beta_neutral = (std::stoi(a.substr(15)) != 0); handled = true; }
-      else if (a.rfind("--beta_lookback=", 0) == 0) { beta_lookback = std::stoi(a.substr(16)); handled = true; }
-      else if (a.rfind("--benchmark=", 0) == 0) { benchmark_path = a.substr(12); handled = true; }
-      if (!handled) cerr<<"Warning: unknown flag '"<<a<<"' (ignored)\n";
-    } else {
-      files.push_back(a);
+    if (argc < 2) {
+        cerr<<"Usage: "<<argv[0]<<" <csv1> [csv2 ...] "
+            <<"[--gap_threshold=bps] [--spread=bps] [--impact=bps_per_pctADV] "
+            <<"[--gross=1.0] [--max_weight=0.05] [--lookback=20] "
+            <<"[--beta_neutral=0|1] [--beta_lookback=60] [--benchmark=path.csv] "
+            <<"[--start=YYYY-MM-DD] [--end=YYYY-MM-DD] "
+            <<"[--target_vol=0.10] [--ewma_lambda=0.94] "
+            <<"[--z_min=1.0] [--z_max=2.5] [--top_frac=0.15] [--stop_bps=12] "
+            <<"[--dump_daily=path.csv] [--dump_equity=path.csv] [--outdir=dir]\n";
+        return 1;
     }
-  }
-  if (files.size() < 1) {
-    cerr<<"Provide 1+ CSVs\n";
-    return 1;
-  }
 
-  unordered_map<string, vector<PriceRecord>> sym_recs;
-  set<int> all_days;
-  for (auto& f : files) {
-    auto& v = sym_recs[basename_noext(f)];
-    read_csv(f, v);
-    std::sort(v.begin(), v.end(), [](const PriceRecord& a, const PriceRecord& b){
-      if (a.y != b.y) return a.y < b.y;
-      if (a.m != b.m) return a.m < b.m;
-      return a.d < b.d;
-    });
-    for (auto& r : v) all_days.insert(yyyymmdd(r.y, r.m, r.d));
-    if (v.size() < (std::size_t)lookback + 2) cerr<<"Warning: "<<f<<" has too few rows.\n";
-  }
+    // core params
+    double gap_bps=20.0, spread_bps=1.0, impact_bps_per_pctADV=0.5;
+    double gross=1.0, max_w=0.05; int lookback=20;
+    bool beta_neutral=false; int beta_lookback=60;
+    string benchmark_path=""; string outdir="";
 
-  vector<PriceRecord> benchmark_recs;
-  vector<double> benchmark_daily_returns;
-  unordered_map<int, PriceRecord> bench_day;
+    // added risk/selection params
+    double target_vol=0.10, vol_ewma_lambda=0.94;
+    double z_min=1.0, z_max=2.5, top_frac=0.15, stop_bps=12.0;
 
-  if (!benchmark_path.empty()) {
-    read_csv(benchmark_path, benchmark_recs);
-    std::sort(benchmark_recs.begin(), benchmark_recs.end(), [](const PriceRecord& a, const PriceRecord& b){
-      if (a.y != b.y) return a.y < b.y;
-      if (a.m != b.m) return a.m < b.m;
-      return a.d < b.d;
-    });
-    for (std::size_t i = 1; i < benchmark_recs.size(); ++i) {
-      double r = (benchmark_recs[i].close / benchmark_recs[i-1].close) - 1.0;
-      benchmark_daily_returns.push_back(r);
+    // optional outputs + date filter
+    string dump_daily="", dump_equity="";
+    int start_date=0, end_date=99991231;
+
+    vector<string> files;
+    for (int i=1;i<argc;++i) {
+        string a=argv[i];
+        if (a.rfind("--", 0) != 0) { files.push_back(a); continue; }
+        bool handled=false;
+        auto val = [&](size_t k){ return a.substr(k); };
+        if      (a.rfind("--gap_threshold=",0)==0){ gap_bps = stod(val(16)); handled=true; }
+        else if (a.rfind("--spread=",0)==0)       { spread_bps = stod(val(9)); handled=true; }
+        else if (a.rfind("--impact=",0)==0)       { impact_bps_per_pctADV = stod(val(9)); handled=true; }
+        else if (a.rfind("--gross=",0)==0)        { gross = stod(val(8)); handled=true; }
+        else if (a.rfind("--max_weight=",0)==0)   { max_w = stod(val(13)); handled=true; }
+        else if (a.rfind("--lookback=",0)==0)     { lookback = stoi(val(11)); handled=true; }
+        else if (a.rfind("--beta_neutral=",0)==0) { beta_neutral = (stoi(val(15))!=0); handled=true; }
+        else if (a.rfind("--beta_lookback=",0)==0){ beta_lookback = stoi(val(16)); handled=true; }
+        else if (a.rfind("--benchmark=",0)==0)    { benchmark_path = val(12); handled=true; }
+        else if (a.rfind("--start=",0)==0)        { auto p=parse_ymd(val(8)); if(p){auto[y,m,d]=*p; start_date=yyyymmdd(y,m,d);} handled=true; }
+        else if (a.rfind("--end=",0)==0)          { auto p=parse_ymd(val(6)); if(p){auto[y,m,d]=*p; end_date=yyyymmdd(y,m,d);} handled=true; }
+        else if (a.rfind("--target_vol=",0)==0)   { target_vol = stod(val(13)); handled=true; }
+        else if (a.rfind("--ewma_lambda=",0)==0)  { vol_ewma_lambda = stod(val(14)); handled=true; }
+        else if (a.rfind("--z_min=",0)==0)        { z_min = stod(val(7)); handled=true; }
+        else if (a.rfind("--z_max=",0)==0)        { z_max = stod(val(7)); handled=true; }
+        else if (a.rfind("--top_frac=",0)==0)     { top_frac = stod(val(11)); handled=true; }
+        else if (a.rfind("--stop_bps=",0)==0)     { stop_bps = stod(val(11)); handled=true; }
+        else if (a.rfind("--dump_daily=",0)==0)   { dump_daily = val(13); handled=true; }
+        else if (a.rfind("--dump_equity=",0)==0)  { dump_equity = val(14); handled=true; }
+        else if (a.rfind("--outdir=",0)==0)       { outdir = val(9); handled=true; }
+        if (!handled) cerr<<"Warning: unknown flag "<<a<<"\n";
     }
-    for (auto& r : benchmark_recs) bench_day[yyyymmdd(r.y, r.m, r.d)] = r;
-  }
 
-  if (all_days.empty()) { cerr<<"No data.\n"; return 1; }
+    if (files.empty()) { cerr<<"No input CSVs provided.\n"; return 1; }
 
-  unordered_map<string, unordered_map<int, PriceRecord>> sym_day;
-  unordered_map<string, unordered_map<int, double>> sym_ocret;
-  unordered_map<string, unordered_map<int, double>> sym_vol20;
-
-  for (auto& kv : sym_recs) {
-    const string& sym = kv.first;
-    const auto& v = kv.second;
-    vector<double> oc; oc.reserve(v.size());
-    for (std::size_t i = 0; i < v.size(); ++i) {
-      sym_day[sym][yyyymmdd(v[i].y, v[i].m, v[i].d)] = v[i];
-      double r = (v[i].open > 0.0) ? (v[i].close - v[i].open) / v[i].open : 0.0;
-      sym_ocret[sym][yyyymmdd(v[i].y, v[i].m, v[i].d)] = r;
-      oc.push_back(r);
+    // load series
+    vector<PriceSeries> series;
+    series.reserve(files.size());
+    for (auto& f : files) {
+        auto ps = load_csv_series(f);
+        if (ps.bars.size() < (size_t)lookback + 5)
+            cerr<<"Warning: "<<ps.sym<<" has few rows: "<<ps.bars.size()<<"\n";
+        if (!ps.bars.empty())
+    series.push_back(std::move(ps));
     }
-    if (v.size() >= (std::size_t)lookback) {
-      double mu = 0.0;
-      for (std::size_t k = 0; k < lookback; ++k) mu += oc[k];
-      mu /= lookback;
-      double v2 = 0.0; for (std::size_t k = 0; k < lookback; ++k) { double d = oc[k] - mu; v2 += d*d; }
-      double s = std::sqrt(v2 / lookback);
-      sym_vol20[sym][yyyymmdd(v[lookback-1].y, v[lookback-1].m, v[lookback-1].d)] = s;
-      for (std::size_t i = lookback; i < v.size(); ++i) {
-        mu = 0.0;
-        for (std::size_t k = i+1-lookback; k <= i; ++k) mu += oc[k];
-        mu /= lookback;
-        v2 = 0.0;
-        for (std::size_t k = i+1-lookback; k <= i; ++k) { double d = oc[k] - mu; v2 += d*d; }
-        s = std::sqrt(v2 / lookback);
-        sym_vol20[sym][yyyymmdd(v[i].y, v[i].m, v[i].d)] = s;
-      }
-    }
-  }
+    if (series.empty()) { cerr<<"No usable data.\n"; return 1; }
 
-  double cap = 1.0, start_cap = 1.0;
-  vector<double> daily_ret; daily_ret.reserve(all_days.size());
-  vector<double> equity; equity.reserve(all_days.size());
-  vector<int> month_keys, year_keys, wday_keys;
-  vector<double> pnl_keys;
-  vector<double> daily_ret_raw; daily_ret_raw.reserve(all_days.size());
-  vector<double> bench_series; bench_series.reserve(all_days.size());
-  double threshold = gap_bps / 10000.0;
-  double spread_cost = spread_bps / 10000.0;
-
-  int prev_day = -1;
-  unordered_map<string, double> prev_close, prev_vol;
-
-  static const char* wdN[] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
-
-  for (int daycode : all_days) {
-    int Y = daycode / 10000, M = (daycode / 100) % 100, D = daycode % 100;
-    double bench_r_today = 0.0;
+    // benchmark
+    PriceSeries bench;
+    vector<double> bench_oc;
     if (!benchmark_path.empty()) {
-      auto itb = bench_day.find(daycode);
-      if (itb != bench_day.end()) {
-        const auto& b = itb->second;
-        bench_r_today = (b.open > 0.0) ? (b.close - b.open) / b.open : 0.0;
-      }
-    }
-
-    struct Item { string sym; double ret; double adv_pct; int dir; double vol; };
-    vector<Item> items;
-
-    for (auto& kv : sym_day) {
-      const string& sym = kv.first;
-      auto it = kv.second.find(daycode);
-      if (it == kv.second.end()) continue;
-      const PriceRecord& rec = it->second;
-      if (!prev_close.count(sym)) { prev_close[sym] = rec.close; prev_vol[sym] = rec.volume; continue; }
-      double gap = (rec.open - prev_close[sym]) / (prev_close[sym] == 0 ? 1 : prev_close[sym]);
-      int dir = 0;
-      if (gap <= -threshold) dir = +1;
-      else if (gap >= threshold) dir = -1;
-      if (dir == 0) { prev_close[sym] = rec.close; prev_vol[sym] = rec.volume; continue; }
-      double r1 = dir * ((rec.close - rec.open) / (rec.open == 0 ? 1 : rec.open));
-      double adv = std::max(1.0, (double)prev_vol[sym]);
-      double adv_pct = 1.0 / adv;
-      double vol = 0.01;
-      auto volit = sym_vol20[sym].find(daycode);
-      if (volit != sym_vol20[sym].end()) vol = std::max(1e-6, volit->second);
-      items.push_back({sym, r1, adv_pct, dir, vol});
-      prev_close[sym] = rec.close;
-      prev_vol[sym] = rec.volume;
-    }
-
-    vector<double> w(items.size(), 0.0);
-    double sumL = 0.0, sumS = 0.0;
-    for (std::size_t i = 0; i < items.size(); ++i) {
-      double base = 1.0 / std::max(1e-6, items[i].vol);
-      double wi = items[i].dir * base;
-      if (std::fabs(wi) > max_w) wi = (wi > 0 ? +max_w : -max_w);
-      w[i] = wi;
-      if (wi > 0) sumL += wi; else sumS += -wi;
-    }
-
-    double gross_now = 0.0;
-    if (sumL > 0.0 && sumS > 0.0) {
-      double scaleL = (0.5 * gross) / sumL;
-      double scaleS = (0.5 * gross) / sumS;
-      for (std::size_t i = 0; i < w.size(); ++i) w[i] = (w[i] > 0 ? w[i] * scaleL : w[i] * scaleS);
-      for (double wi : w) gross_now += std::fabs(wi);
-    } else {
-      w.assign(w.size(), 0.0);
-    }
-
-    double portfolio_r = 0.0;
-    for (std::size_t i = 0; i < items.size(); ++i) {
-      if (w[i] == 0.0) continue;
-      double impact = (impact_bps_per_pctADV / 10000.0) * items[i].adv_pct;
-      double total_cost = 2.0 * (spread_cost + impact);
-      double ri = items[i].ret - total_cost;
-      portfolio_r += w[i] * ri;
-    }
-
-    double portfolio_r_raw = portfolio_r;
-
-    if (beta_neutral && !benchmark_daily_returns.empty()) {
-      vector<double>& P = daily_ret;
-      vector<double>& B = benchmark_daily_returns;
-      std::size_t lookback_n = std::min(P.size(), (std::size_t)beta_lookback);
-      if (lookback_n > 1) {
-        double mu_p = 0.0, mu_b = 0.0;
-        for (std::size_t k = 0; k < lookback_n; ++k) {
-          mu_p += P[P.size()-1-k];
-          mu_b += B[B.size()-1-k];
+        bench = load_csv_series(benchmark_path);
+        if (bench.bars.size() >= 2) {
+            bench_oc.reserve(bench.bars.size());
+            for (size_t i=0;i<bench.bars.size();++i) {
+                // open->close of the same day (avoid lookahead)
+                double r = (bench.bars[i].open > 0.0) ? (bench.bars[i].close - bench.bars[i].open)/bench.bars[i].open : 0.0;
+                bench_oc.push_back(r);
+            }
+        } else {
+            cerr<<"Warning: benchmark file has too few rows\n";
         }
-        mu_p /= lookback_n; mu_b /= lookback_n;
-        double cov = 0.0, var_b = 0.0;
-        for (std::size_t k = 0; k < lookback_n; ++k) {
-          double dp = P[P.size()-1-k] - mu_p;
-          double db = B[B.size()-1-k] - mu_b;
-          cov += dp * db;
-          var_b += db * db;
-        }
-        if (var_b > 0.0) {
-          double beta = cov / var_b;
-          portfolio_r -= beta * bench_r_today;
-        }
-      }
     }
 
-    cap *= (1.0 + portfolio_r);
-    daily_ret_raw.push_back(portfolio_r_raw);
-    daily_ret.push_back(portfolio_r);
-    bench_series.push_back(bench_r_today);
-    pnl_keys.push_back(portfolio_r);
-    equity.push_back(cap);
-    month_keys.push_back(M);
-    year_keys.push_back(Y);
-    wday_keys.push_back(weekday(Y, M, D));
-    prev_day = daycode;
-  }
+    // calendar set
+    set<int> all_days;
+    for (auto& ps : series) for (auto& b : ps.bars) {
+        if (b.date < start_date || b.date > end_date) continue;
+        all_days.insert(b.date);
+    }
+    if (all_days.empty()) { cerr<<"No dates within selection.\n"; return 1; }
 
-  double tot = (cap - start_cap) / start_cap * 100.0;
-  double mu = 0.0; for (double r : daily_ret) mu += r; mu = std::max<std::size_t>(1, daily_ret.size()) ? mu / daily_ret.size() : 0.0;
-  double var = 0.0; for (double r : daily_ret) { double d = r - mu; var += d*d; } var /= std::max<std::size_t>(1, daily_ret.size());
-  double sd = std::sqrt(var);
-  auto [dd, sIdx, eIdx] = max_dd(equity);
-  double v95 = var95(daily_ret);
-  double cv95 = cvar95(daily_ret);
+    // per-symbol previous close & volume for gap/ADV
+    unordered_map<string, double> prev_close, prev_vol;
+    // rolling O->C vol per symbol per date (stdev over lookback)
+    unordered_map<string, unordered_map<int,double>> sym_vol;
+    // build rolling vol
+    for (auto& ps : series) {
+        if (ps.bars.size() < (size_t)lookback) continue;
+        vector<double> oc(ps.bars.size(), 0.0);
+        for (size_t i=0;i<ps.bars.size();++i) {
+            oc[i] = (ps.bars[i].open>0.0) ? (ps.bars[i].close - ps.bars[i].open)/ps.bars[i].open : 0.0;
+        }
+        // rolling stdev
+        double m=0.0;
+        for (int i=0;i<lookback;i++) m += oc[i];
+        m /= lookback;
+        double s2=0.0;
+        for (int i=0;i<lookback;i++){ double d=oc[i]-m; s2+=d*d; }
+        double sigma = sqrt(s2/lookback);
+        sym_vol[ps.sym][ps.bars[lookback-1].date] = max(1e-6, sigma);
+        for (size_t i=lookback;i<ps.bars.size();++i) {
+            double sum=0.0;
+            for (size_t k=i+1-lookback;k<=i;k++) sum += oc[k];
+            double mu = sum/(double)lookback;
+            double var=0.0;
+            for (size_t k=i+1-lookback;k<=i;k++){ double d=oc[k]-mu; var += d*d; }
+            double sig = sqrt(var/(double)lookback);
+            sym_vol[ps.sym][ps.bars[i].date] = max(1e-6, sig);
+        }
+    }
 
-  auto agg = [&](const vector<int>& keys){
-    unordered_map<int,double> m;
-    for (std::size_t i = 0; i < keys.size(); ++i) m[keys[i]] += pnl_keys[i];
-    return m;
-  };
-  auto monthly = agg(month_keys);
-  auto yearly  = agg(year_keys);
-  auto wday    = agg(wday_keys);
+    // state
+    double cap=1.0, start_cap=1.0;
+    vector<double> daily_ret, daily_ret_raw, equity, bench_series;
+    vector<int> months, years, wdays;
+    vector<double> pnl_bucket;
 
-  cout<<"Market–Neutral Gap–Fade Portfolio Report\n";
-  cout<<"========================================\n";
-  cout<<"Files loaded: "; for (auto& f : files) cout<<f<<" "; cout<<"\n";
-  cout<<"Trading days: "<<daily_ret.size()<<"\n";
-  cout<<"Gross leverage: "<<gross<<" | Per–name cap: "<<max_w<<" | Lookback: "<<lookback<<"\n";
-  cout<<"Threshold: "<<gap_bps<<" bps | Spread: "<<spread_bps<<" bps | Impact: "<<impact_bps_per_pctADV<<" bps/%ADV\n\n";
+    daily_ret.reserve(all_days.size());
+    daily_ret_raw.reserve(all_days.size());
+    equity.reserve(all_days.size());
+    bench_series.reserve(all_days.size());
+    pnl_bucket.reserve(all_days.size());
+    months.reserve(all_days.size());
+    years.reserve(all_days.size());
+    wdays.reserve(all_days.size());
 
-  cout<<"Total return: "<<tot<<" %\n";
-  cout<<"Mean daily: "<<mu*100<<" % | Stdev: "<<sd*100<<" %\n";
-  cout<<"Sharpe: "<<sharpe(daily_ret)<<" | Sortino: "<<sortino(daily_ret)<<"\n";
-  cout<<"Max drawdown: "<<dd*100<<" %\n";
-  cout<<"Win rate: "<<(100.0 * std::max<std::size_t>(1, std::count_if(daily_ret.begin(), daily_ret.end(), [](double r){return r>0;})) / std::max<std::size_t>(1, daily_ret.size()))<<" %\n";
-  cout<<"VaR 95%: "<<v95*100<<" % | CVaR 95%: "<<cv95*100<<" %\n\n";
+    double threshold = gap_bps/10000.0;
+    double spread_cost = spread_bps/10000.0;
+    double ewma_var = 0.0;
+    const double ANN = sqrt(252.0);
 
-  cout<<"Monthly PnL (% of capital):\n";
-  for (auto& kv : monthly) cout<<"Month "<<kv.first<<": "<<kv.second*100<<" %\n";
-  cout<<"\nYearly PnL (% of capital):\n";
-  for (auto& kv : yearly) cout<<"Year "<<kv.first<<": "<<kv.second*100<<" %\n";
-  cout<<"\nWeekday PnL (% of capital):\n";
-  for (auto& kv : wday) if (kv.first >= 0 && kv.first < 7)
-    cout<<wdN[kv.first]<<": "<<kv.second * 100<<" %\n";
+    // helpers for lookups
+    auto find_bar = [&](PriceSeries& ps, int date)->optional<Bar>{
+        auto it = ps.idx.find(date);
+        if (it==ps.idx.end()) return nullopt;
+        return ps.bars[it->second];
+    };
 
-  return 0;
+    // main day loop
+    for (int date : all_days) {
+        int Y = date/10000, M=(date/100)%100, D=date%100;
+
+        // benchmark O->C today
+        double bench_r_today = 0.0;
+        if (!bench.bars.empty()) {
+            auto b = find_bar(bench, date);
+            if (b) {
+                bench_r_today = (b->open>0.0) ? (b->close - b->open)/b->open : 0.0;
+            }
+        }
+
+        // collect candidates
+        vector<Item> items;
+        items.reserve(series.size());
+
+        for (auto& ps : series) {
+            auto br = find_bar(ps, date);
+            if (!br) continue;
+            const Bar& rec = *br;
+
+            if (!prev_close.count(ps.sym)) {
+                prev_close[ps.sym] = rec.close;
+                prev_vol[ps.sym]   = rec.volume > 0.0 ? rec.volume : 1.0;
+                continue;
+            }
+            double pc = prev_close[ps.sym];
+            if (pc <= 0.0) { prev_close[ps.sym]=rec.close; prev_vol[ps.sym]=max(1.0, rec.volume); continue; }
+
+            double gap = (rec.open - pc) / pc;
+            int dir = 0;
+            if (gap <= -threshold) dir = +1; // fade gap-down
+            else if (gap >=  threshold) dir = -1; // fade gap-up
+            if (dir == 0) { prev_close[ps.sym]=rec.close; prev_vol[ps.sym]=max(1.0, rec.volume); continue; }
+
+            double oc = (rec.open>0.0) ? (rec.close - rec.open)/rec.open : 0.0;
+            double adv = max(1.0, prev_vol[ps.sym]);
+
+            double vol = 0.01;
+            auto sv = sym_vol[ps.sym].find(date);
+            if (sv != sym_vol[ps.sym].end()) vol = max(1e-6, sv->second);
+
+            double z = gap / max(1e-6, vol);
+            if (fabs(z) < z_min || fabs(z) > z_max) {
+                prev_close[ps.sym]=rec.close; prev_vol[ps.sym]=max(1.0, rec.volume); continue;
+            }
+
+            items.push_back({ps.sym, oc, 1.0/adv, dir, vol, z});
+            prev_close[ps.sym]=rec.close; prev_vol[ps.sym]=max(1.0, rec.volume);
+        }
+
+        if (items.empty()) {
+            // still book zero day for equity continuity
+            daily_ret_raw.push_back(0.0);
+            daily_ret.push_back(0.0);
+            bench_series.push_back(bench_r_today);
+            pnl_bucket.push_back(0.0);
+            equity.push_back(cap);
+            months.push_back(M); years.push_back(Y); wdays.push_back(weekday(Y,M,D));
+            continue;
+        }
+
+        // rank by |z| and keep top fraction
+        sort(items.begin(), items.end(), [](const Item& a, const Item& b){ return fabs(a.z) > fabs(b.z); });
+        size_t keepN = max<size_t>(1, (size_t)llround(top_frac * (double)items.size()));
+        if (keepN < items.size()) items.resize(keepN);
+
+        // raw weights inverse-vol, cap per-name; then scale L/S to meet gross and dollar-neutral
+        vector<double> w(items.size(), 0.0);
+        double sumL=0.0, sumS=0.0;
+        for (size_t i=0;i<items.size();++i) {
+            double base = 1.0 / max(1e-6, items[i].vol);
+            double wi = items[i].dir * base;
+            if (fabs(wi) > max_w) wi = (wi > 0 ? +max_w : -max_w);
+            w[i] = wi;
+            if (wi > 0) sumL += wi; else sumS += -wi;
+        }
+        if (sumL>0.0 && sumS>0.0) {
+            double scaleL = (0.5 * gross) / sumL;
+            double scaleS = (0.5 * gross) / sumS;
+            for (size_t i=0;i<w.size();++i) w[i] = (w[i] > 0 ? w[i]*scaleL : w[i]*scaleS);
+        } else {
+            // no cross-section both sides -> flat
+            fill(w.begin(), w.end(), 0.0);
+        }
+
+        // per-name costs and stop cap
+        double portfolio_r = 0.0;
+        for (size_t i=0;i<items.size();++i) {
+            if (w[i]==0.0) continue;
+            // round-trip cost: 2 * (spread + impact)
+            double impact = (impact_bps_per_pctADV/10000.0) * items[i].adv_pct;
+            double total_cost = 2.0*(spread_cost + impact);
+            double ri = items[i].ret - total_cost;
+            // per-name stop cap
+            ri = max(ri, -stop_bps/10000.0);
+            portfolio_r += w[i] * ri;
+        }
+        double portfolio_r_raw = portfolio_r;
+
+        // beta-neutral hedge (rolling OLS beta of daily_ret vs benchmark open->close)
+        if (beta_neutral && !bench.bars.empty() && !daily_ret.empty()) {
+            size_t look = min((size_t)beta_lookback, daily_ret.size());
+            if (look >= 5 && bench_series.size() >= look) {
+                double mu_p=0.0, mu_b=0.0;
+                for (size_t k=0;k<look;k++) { mu_p += daily_ret[daily_ret.size()-1-k]; mu_b += bench_series[bench_series.size()-1-k]; }
+                mu_p/=look; mu_b/=look;
+                double cov=0.0, varb=0.0;
+                for (size_t k=0;k<look;k++) {
+                    double dp = daily_ret[daily_ret.size()-1-k] - mu_p;
+                    double db = bench_series[bench_series.size()-1-k] - mu_b;
+                    cov += dp*db; varb += db*db;
+                }
+                if (varb > 1e-12) {
+                    double beta = cov/varb;
+                    portfolio_r -= beta * bench_r_today;
+                }
+            }
+        }
+
+        // vol targeting (EWMA)
+        double sigma_prev = sqrt(max(ewma_var, 0.0)) * ANN;
+        double scale = (sigma_prev > 1e-10) ? (target_vol / sigma_prev) : 1.0;
+        scale = clamp(scale, 0.10, 3.0); // guard rails
+        portfolio_r *= scale;
+        ewma_var = vol_ewma_lambda*ewma_var + (1.0 - vol_ewma_lambda)*(portfolio_r*portfolio_r);
+
+        // book
+        cap *= (1.0 + portfolio_r);
+        daily_ret_raw.push_back(portfolio_r_raw);
+        daily_ret.push_back(portfolio_r);
+        bench_series.push_back(bench_r_today);
+        pnl_bucket.push_back(portfolio_r);
+        equity.push_back(cap);
+        months.push_back(M);
+        years.push_back(Y);
+        wdays.push_back(weekday(Y,M,D));
+    }
+
+    // stats
+    double tot = (cap - start_cap)/max(start_cap,1e-12) * 100.0;
+    double mu = mean(daily_ret), var = variance(daily_ret, mu), sd = sqrt(max(var,0.0));
+    double shr = sharpe(daily_ret), sor = sortino(daily_ret);
+    int wins=0; for (double r: daily_ret) if (r>0) ++wins;
+    auto [dd, sIdx, eIdx] = max_drawdown_from_equity(equity);
+    double v95 = var95(daily_ret), cv95 = cvar95(daily_ret);
+
+    auto agg_by = [&](const vector<int>& keys){
+        unordered_map<int,double> m;
+        for (size_t i=0;i<keys.size();++i) m[keys[i]] += pnl_bucket[i];
+        return m;
+    };
+    auto mon = agg_by(months);
+    auto yr  = agg_by(years);
+    auto wd  = agg_by(wdays);
+    static const char* wdN[]={"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
+
+    cout.setf(ios::fixed); cout<<setprecision(6);
+    cout<<"Market–Neutral Gap–Fade Portfolio Report\n";
+    cout<<"========================================\n";
+    cout<<"Files loaded: "; for (auto& f : files) cout<<f<<" "; cout<<"\n";
+    cout<<"Trading days: "<<daily_ret.size()<<"\n";
+    cout<<"Gross: "<<gross<<" | Per-name cap: "<<max_w<<" | Lookback: "<<lookback<<"\n";
+    cout<<"Threshold: "<<gap_bps<<" bps | Spread: "<<spread_bps<<" bps | Impact: "<<impact_bps_per_pctADV<<" bps/%ADV\n";
+    cout<<"VolTarget: "<<(target_vol*100)<<"% | EWMA λ: "<<vol_ewma_lambda<<" | z∈["<<z_min<<","<<z_max<<"] | top_frac: "<<top_frac<<" | stop_bps: "<<stop_bps<<"\n";
+    if (!benchmark_path.empty()) cout<<"Benchmark: "<<benchmark_path<<" | BetaNeutral: "<<(beta_neutral?"ON":"OFF")<<" | beta_lookback "<<beta_lookback<<"\n";
+    cout<<"\n";
+
+    cout<<"Total return: "<<tot<<" %\n";
+    cout<<"Mean daily: "<<mu*100<<" % | Stdev: "<<sd*100<<" %\n";
+    cout<<"Sharpe: "<<shr<<" | Sortino: "<<sor<<"\n";
+    cout<<"Max drawdown: "<<dd*100<<" %\n";
+    cout<<"Win rate: "<<(100.0*wins/max<size_t>(1,daily_ret.size()))<<" %\n";
+    cout<<"VaR 95%: "<<v95*100<<" % | CVaR 95%: "<<cv95*100<<" %\n\n";
+
+    cout<<"Monthly PnL (% of capital):\n";
+    for (auto& kv : mon) cout<<"Month "<<kv.first<<": "<<kv.second*100<<" %\n";
+    cout<<"\nYearly PnL (% of capital):\n";
+    for (auto& kv : yr)  cout<<"Year "<<kv.first<<": "<<kv.second*100<<" %\n";
+    cout<<"\nWeekday PnL (% of capital):\n";
+    for (auto& kv : wd) if (kv.first>=0 && kv.first<7) cout<<wdN[kv.first]<<": "<<kv.second*100<<" %\n";
+
+    // optional dumps
+    auto safe_open = [&](const string& rel)->optional<ofstream>{
+        string fn = rel;
+        if (!outdir.empty()) {
+            string sep = (outdir.back()=='/'||outdir.back()=='\\')?"" : "/";
+            fn = outdir + sep + rel;
+        }
+        ofstream ofs(fn);
+        if (!ofs.is_open()) { cerr<<"Failed to open "<<fn<<" for write\n"; return nullopt; }
+        return ofs;
+    };
+
+    if (!dump_daily.empty()) {
+        auto f = safe_open(dump_daily);
+        if (f) {
+            *f << "day_index,ret\n";
+            for (size_t i=0;i<daily_ret.size();++i) *f << i << "," << setprecision(10) << daily_ret[i] << "\n";
+        }
+    }
+    if (!dump_equity.empty()) {
+        auto f = safe_open(dump_equity);
+        if (f) {
+            *f << "day_index,equity\n";
+            for (size_t i=0;i<equity.size();++i) *f << i << "," << setprecision(10) << equity[i] << "\n";
+        }
+    }
+
+    return 0;
 }
