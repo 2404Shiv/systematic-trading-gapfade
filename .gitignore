@@ -27,3 +27,6 @@ gapfade
 data/*.csv
 !data/README.md
 results/
+runs/
+*.csv
+*.log
