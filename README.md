@@ -13,3 +13,6 @@ git init
 git add gap_fade_strategy.cpp scripts README.md .gitignore data/README.md
 git commit -m "Initial commit: gap-fade engine, scripts, docs"
 gh repo create yourname/gapfade --public --source=. --remote=origin --push
+
+
+![Equity curve](docs/equity.png)

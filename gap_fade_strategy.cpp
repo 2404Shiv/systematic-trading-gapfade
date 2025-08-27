@@ -93,6 +93,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 
 
 using namespace std;
@@ -110,6 +111,54 @@ struct PriceSeries {
 };
 
 // ---------- utils ----------
+static bool leap(int y){ return (y%4==0 && y%100!=0) || (y%400==0); }
+static int mdays(int y,int m){
+    static int d[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    return (m==2? (leap(y)?29:28) : d[m-1]);
+}
+static void add_days(int& y,int& m,int& d,int k){
+    // k can be negative; simple day stepping (few calls per earnings date)
+    while(k>0){ int md=mdays(y,m); if(++d>md){ d=1; if(++m>12){ m=1; ++y; } } --k; }
+    while(k<0){ if(--d<1){ if(--m<1){ m=12; --y; } d=mdays(y,m); } ++k; }
+}
+
+static void read_earnings(const string& path, int window_days,
+                          unordered_map<string, unordered_set<int>>& blocked){
+    if (path.empty()) return;
+    ifstream f(path);
+    if (!f.is_open()) { cerr<<"Cannot open earnings "<<path<<"\n"; return; }
+    string line;
+    while (getline(f, line)) {
+        if (line.empty()) continue;
+        size_t c = line.find(',');
+        if (c == string::npos) continue;
+        string sym = line.substr(0, c);
+        int e = stoi(line.substr(c + 1));
+        int y = e / 10000, m = (e / 100) % 100, d = e % 100;
+        for (int k = -window_days; k <= window_days; ++k) {
+            int yy = y, mm = m, dd = d;
+            add_days(yy, mm, dd, k);
+            int code = 10000*yy + 100*mm + dd; blocked[sym].insert(code);
+        }
+    }
+}
+
+// ---- read sectors map: sym -> sector_id ----
+static void read_sectors(const string& path, unordered_map<string,int>& sec){
+    if (path.empty()) return;
+    ifstream f(path);
+    if (!f.is_open()) { cerr<<"Cannot open sectors "<<path<<"\n"; return; }
+    string line;
+    while (getline(f, line)) {
+        if (line.empty()) continue;
+        size_t c = line.find(',');
+        if (c == string::npos) continue;
+        string sym = line.substr(0, c);
+        int sid = stoi(line.substr(c + 1));
+        sec[sym] = sid;
+    }
+}
+
 static inline int yyyymmdd(int y, int m, int d) { return y*10000 + m*100 + d; }
 
 static inline optional<tuple<int,int,int>> parse_ymd(const string& s) {
@@ -281,13 +330,13 @@ static PriceSeries load_csv_series(const string& path) {
 }
 
 // ---------- main ----------
-struct Item {
-    string sym;
-    double ret;        // signed O->C ret (fade direction applied later via dir)
-    double adv_pct;    // frac ADV consumed proxy (1/prev_volume)
-    int    dir;        // +1 for long, -1 for short
-    double vol;        // rolling O->C stdev
-    double z;          // gap z-score
+struct Item { 
+  std::string sym;
+  double ret;
+  double adv_pct; 
+  int dir; 
+  double vol; 
+  double z; 
 };
 
 int main(int argc, char** argv) {
@@ -302,51 +351,86 @@ int main(int argc, char** argv) {
             <<"[--start=YYYY-MM-DD] [--end=YYYY-MM-DD] "
             <<"[--target_vol=0.10] [--ewma_lambda=0.94] "
             <<"[--z_min=1.0] [--z_max=2.5] [--top_frac=0.15] [--stop_bps=12] "
-            <<"[--dump_daily=path.csv] [--dump_equity=path.csv] [--outdir=dir]\n";
+            <<"\n";
         return 1;
     }
 
-    // core params
-    double gap_bps=20.0, spread_bps=1.0, impact_bps_per_pctADV=0.5;
-    double gross=1.0, max_w=0.05; int lookback=20;
-    bool beta_neutral=false; int beta_lookback=60;
-    string benchmark_path=""; string outdir="";
+   // core params
+double gap_bps = 20.0, spread_bps = 1.0, impact_bps_per_pctADV = 0.5;
+double gross   = 1.0,  max_w     = 0.05;  int lookback = 20;
+bool   beta_neutral = true;                int beta_lookback = 60;
+std::string benchmark_path = "";          std::string outdir = "";
 
-    // added risk/selection params
-    double target_vol=0.10, vol_ewma_lambda=0.94;
-    double z_min=1.0, z_max=2.5, top_frac=0.15, stop_bps=12.0;
+// added risk/selection params
+double target_vol        = 0.10,  vol_ewma_lambda = 0.94;
+double z_min             = 0.00,  z_max           = 3.00,
+       top_frac          = 1.00,  stop_bps        = 0.00;
+bool   require_both_sides = false;
 
-    // optional outputs + date filter
-    string dump_daily="", dump_equity="";
-    int start_date=0, end_date=99991231;
+double tp_bps = 0.0;                  // per-name take-profit in bps of price (0=off)
+string earnings_path = "";            // csv: SYM,yyyymmdd
+int    earnings_window = 1;           // skip trades +/-N days around earnings
+string sectors_path = "";             // csv: SYM,sector_id
+bool   sector_neutral = false;        // project weights to sector-neutral
+double dd_limit = 0.10;               // book-level DD at which leverage goes to zero (10%)
+
+// optional outputs + date filter
+std::string dump_daily = "", dump_equity = "";
+int start_date = 0, end_date = 99991231;
 
     vector<string> files;
     for (int i=1;i<argc;++i) {
         string a=argv[i];
         if (a.rfind("--", 0) != 0) { files.push_back(a); continue; }
-        bool handled=false;
-        auto val = [&](size_t k){ return a.substr(k); };
-        if      (a.rfind("--gap_threshold=",0)==0){ gap_bps = stod(val(16)); handled=true; }
-        else if (a.rfind("--spread=",0)==0)       { spread_bps = stod(val(9)); handled=true; }
-        else if (a.rfind("--impact=",0)==0)       { impact_bps_per_pctADV = stod(val(9)); handled=true; }
-        else if (a.rfind("--gross=",0)==0)        { gross = stod(val(8)); handled=true; }
-        else if (a.rfind("--max_weight=",0)==0)   { max_w = stod(val(13)); handled=true; }
-        else if (a.rfind("--lookback=",0)==0)     { lookback = stoi(val(11)); handled=true; }
-        else if (a.rfind("--beta_neutral=",0)==0) { beta_neutral = (stoi(val(15))!=0); handled=true; }
-        else if (a.rfind("--beta_lookback=",0)==0){ beta_lookback = stoi(val(16)); handled=true; }
-        else if (a.rfind("--benchmark=",0)==0)    { benchmark_path = val(12); handled=true; }
-        else if (a.rfind("--start=",0)==0)        { auto p=parse_ymd(val(8)); if(p){auto[y,m,d]=*p; start_date=yyyymmdd(y,m,d);} handled=true; }
-        else if (a.rfind("--end=",0)==0)          { auto p=parse_ymd(val(6)); if(p){auto[y,m,d]=*p; end_date=yyyymmdd(y,m,d);} handled=true; }
-        else if (a.rfind("--target_vol=",0)==0)   { target_vol = stod(val(13)); handled=true; }
-        else if (a.rfind("--ewma_lambda=",0)==0)  { vol_ewma_lambda = stod(val(14)); handled=true; }
-        else if (a.rfind("--z_min=",0)==0)        { z_min = stod(val(7)); handled=true; }
-        else if (a.rfind("--z_max=",0)==0)        { z_max = stod(val(7)); handled=true; }
-        else if (a.rfind("--top_frac=",0)==0)     { top_frac = stod(val(11)); handled=true; }
-        else if (a.rfind("--stop_bps=",0)==0)     { stop_bps = stod(val(11)); handled=true; }
-        else if (a.rfind("--dump_daily=",0)==0)   { dump_daily = val(13); handled=true; }
-        else if (a.rfind("--dump_equity=",0)==0)  { dump_equity = val(14); handled=true; }
-        else if (a.rfind("--outdir=",0)==0)       { outdir = val(9); handled=true; }
-        if (!handled) cerr<<"Warning: unknown flag "<<a<<"\n";
+        bool handled = false;
+
+// helpers: read after '=' safely
+auto after_eq = [&]() -> std::string {
+    size_t k = a.find('=');
+    return (k == std::string::npos) ? std::string() : a.substr(k + 1);
+};
+auto as_d = [&]() -> double { return std::stod(after_eq()); };
+auto as_i = [&]() -> int    { return std::stoi(after_eq()); };
+auto as_s = [&]() -> std::string { return after_eq(); };
+
+if      (a.rfind("--gap_threshold", 0) == 0) { gap_bps                = as_d(); handled = true; }
+else if (a.rfind("--spread",        0) == 0) { spread_bps             = as_d(); handled = true; }
+else if (a.rfind("--impact",        0) == 0) { impact_bps_per_pctADV  = as_d(); handled = true; }
+else if (a.rfind("--gross",         0) == 0) { gross                  = as_d(); handled = true; }
+else if (a.rfind("--max_weight",    0) == 0) { max_w                  = as_d(); handled = true; }
+else if (a.rfind("--lookback",      0) == 0) { lookback               = as_i(); handled = true; }
+else if (a.rfind("--beta_neutral",  0) == 0) { beta_neutral           = (as_i() != 0); handled = true; }
+else if (a.rfind("--beta_lookback", 0) == 0) { beta_lookback          = as_i(); handled = true; }
+else if (a.rfind("--benchmark",     0) == 0) { benchmark_path         = as_s(); handled = true; }
+else if (a.rfind("--start",         0) == 0) { 
+    auto p = parse_ymd(as_s()); 
+    if (p) { auto [y,m,d] = *p; start_date = yyyymmdd(y,m,d); } 
+    handled = true; 
+}
+else if (a.rfind("--end",           0) == 0) { 
+    auto p = parse_ymd(as_s()); 
+    if (p) { auto [y,m,d] = *p; end_date = yyyymmdd(y,m,d); } 
+    handled = true; 
+}
+
+else if (a.rfind("--target_vol",    0) == 0) { target_vol             = as_d(); handled = true; }
+else if (a.rfind("--ewma_lambda",   0) == 0) { vol_ewma_lambda        = as_d(); handled = true; }
+else if (a.rfind("--z_min",         0) == 0) { z_min                  = as_d(); handled = true; }
+else if (a.rfind("--z_max",         0) == 0) { z_max                  = as_d(); handled = true; }
+else if (a.rfind("--top_frac",      0) == 0) { top_frac               = as_d(); handled = true; }
+else if (a.rfind("--stop_bps",      0) == 0) { stop_bps               = as_d(); handled = true; }
+else if (a.rfind("--both_sides",    0) == 0) { require_both_sides     = (as_i() != 0); handled = true; }
+else if (a.rfind("--dump_daily",    0) == 0) { dump_daily             = as_s(); handled = true; }
+else if (a.rfind("--dump_equity",   0) == 0) { dump_equity            = as_s(); handled = true; }
+else if (a.rfind("--outdir",        0) == 0) { outdir                 = as_s(); handled = true; }
+else if (a.rfind("--tp_bps=",0)==0)       { tp_bps = stod(a.substr(9)); handled=true; }
+else if (a.rfind("--earnings=",0)==0)     { earnings_path = a.substr(11); handled=true; }
+else if (a.rfind("--earnings_window=",0)==0){ earnings_window = stoi(a.substr(18)); handled=true; }
+else if (a.rfind("--sectors=",0)==0)      { sectors_path = a.substr(10); handled=true; }
+else if (a.rfind("--sector_neutral=",0)==0){ sector_neutral = (stoi(a.substr(17))!=0); handled=true; }
+else if (a.rfind("--dd_limit=",0)==0)     { dd_limit = stod(a.substr(11)); handled=true; }
+else if (a.rfind("--tp_bps",0)==0) { tp_bps = stod(a.substr(9)); handled=true; }
+if (!handled) cerr << "Warning: unknown flag '" << a << "' (ignored)\n";
     }
 
     if (files.empty()) { cerr<<"No input CSVs provided.\n"; return 1; }
@@ -386,6 +470,12 @@ int main(int argc, char** argv) {
         if (b.date < start_date || b.date > end_date) continue;
         all_days.insert(b.date);
     }
+  unordered_map<string, unordered_set<int>> earnings_block;
+  unordered_map<string,int>                sym_sector;
+
+  if (!earnings_path.empty()) read_earnings(earnings_path, earnings_window, earnings_block);
+  if (!sectors_path.empty())  read_sectors(sectors_path, sym_sector);
+
     if (all_days.empty()) { cerr<<"No dates within selection.\n"; return 1; }
 
     // per-symbol previous close & volume for gap/ADV
@@ -437,6 +527,7 @@ int main(int argc, char** argv) {
     double spread_cost = spread_bps/10000.0;
     double ewma_var = 0.0;
     const double ANN = sqrt(252.0);
+    double cap_peak = start_cap; // track running equity peak
 
     // helpers for lookups
     auto find_bar = [&](PriceSeries& ps, int date)->optional<Bar>{
@@ -467,6 +558,14 @@ int main(int argc, char** argv) {
             if (!br) continue;
             const Bar& rec = *br;
 
+            if (!earnings_path.empty()) {
+           const string& sym = ps.sym;      // <-- your series object already has symbol
+           auto eb = earnings_block.find(sym);
+            if (eb != earnings_block.end() && eb->second.count(date)) {
+            continue; // skip around earnings
+            }
+        }
+
             if (!prev_close.count(ps.sym)) {
                 prev_close[ps.sym] = rec.close;
                 prev_vol[ps.sym]   = rec.volume > 0.0 ? rec.volume : 1.0;
@@ -493,9 +592,21 @@ int main(int argc, char** argv) {
                 prev_close[ps.sym]=rec.close; prev_vol[ps.sym]=max(1.0, rec.volume); continue;
             }
 
+           double r = dir * (rec.close - rec.open) / (rec.open > 0.0 ? rec.open : 1.0);
+          if (stop_bps > 0.0) { double stop_r = -stop_bps / 10000.0; if (r < stop_r) r = stop_r; }
+          if (tp_bps  > 0.0) { double  tp_r =   tp_bps / 10000.0; if (r >  tp_r) r =  tp_r; }
+            // clamp by stop-loss / take-profit (bps of price)
+            if (stop_bps > 0.0) {
+                double stop_r = -stop_bps / 10000.0;
+                if (r < stop_r) r = stop_r;
+            }
+            if (tp_bps > 0.0) {
+                double tp_r = tp_bps / 10000.0;
+                if (r > tp_r) r = tp_r;
+            } 
             items.push_back({ps.sym, oc, 1.0/adv, dir, vol, z});
             prev_close[ps.sym]=rec.close; prev_vol[ps.sym]=max(1.0, rec.volume);
-        }
+             }
 
         if (items.empty()) {
             // still book zero day for equity continuity
@@ -504,6 +615,13 @@ int main(int argc, char** argv) {
             bench_series.push_back(bench_r_today);
             pnl_bucket.push_back(0.0);
             equity.push_back(cap);
+            if (cap > cap_peak) cap_peak = cap;
+            if (cap < cap_peak * (1.0 - dd_limit)) {
+              std::cout << "Max DD stop hit ("
+              << (1.0 - cap/cap_peak) * 100.0
+              << "%) on " << Y << "-" << M << "-" << D << ". Stopping.\n";
+             break; // exits the daily loop
+             }
             months.push_back(M); years.push_back(Y); wdays.push_back(weekday(Y,M,D));
             continue;
         }
