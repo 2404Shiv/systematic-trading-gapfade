@@ -1,9 +1,17 @@
-gap_fade
-*.o
-out/
-*.png
-data/*.csv
-!data/sample/*.csv
+# RStudio/OS junk
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
 .DS_Store
-.vscode/
-.idea/
+
+# Outputs (generated; not versioned)
+output/
+DeepLOB_auto_report.html
+
+# Data: keep empty placeholder only
+data/*
+!data/README.md
+
+# renv local lib
+renv/library/
