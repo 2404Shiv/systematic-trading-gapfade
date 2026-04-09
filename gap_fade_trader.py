@@ -1,4 +1,9 @@
 import os, json, time, math, threading, schedule, logging, sqlite3
+try:
+    from ibkr_trader import IBKRTrader
+    IBKR_AVAILABLE = True
+except:
+    IBKR_AVAILABLE = False
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -6,13 +11,10 @@ import numpy as np
 import yfinance as yf
 from flask import Flask, jsonify, render_template_string
 
-GAP_THRESHOLD_BPS=25; SPREAD_BPS=1.0; IMPACT_BPS=0.5; GROSS=1.0
-MAX_WEIGHT=0.02; LOOKBACK=20; Z_MIN=0.8; Z_MAX=3.0; TOP_FRAC=0.50
+GAP_THRESHOLD_BPS=15; SPREAD_BPS=1.0; IMPACT_BPS=0.5; GROSS=1.0
+MAX_WEIGHT=0.02; LOOKBACK=20; Z_MIN=0.5; Z_MAX=3.0; TOP_FRAC=0.50
 STOP_BPS=10.0; TARGET_VOL=0.06; EWMA_LAMBDA=0.97; PAPER_CAPITAL=100_000.0
-UNIVERSE=["AAPL","MSFT","GOOGL","AMZN","META","TSLA","NVDA","JPM","V","MA",
-"UNH","JNJ","PG","HD","BAC","XOM","CVX","ABBV","MRK","PEP","KO","AVGO",
-"COST","TMO","MCD","ACN","CSCO","LIN","DHR","ABT","TXN","NEE","PM","BMY",
-"QCOM","HON","UPS","LOW","SBUX","INTU","AMAT","DE","GS","BLK","CAT","AXP"]
+UNIVERSE = ['CSCO', 'UAL', 'TROW', 'ISRG', 'NVR', 'TPR', 'DVN', 'BA', 'VRTX', 'GILD', 'TKO', 'EQIX', 'TER', 'PODD', 'MDT', 'V', 'A', 'FOX', 'MO', 'CTRA', 'SWKS', 'ENPH', 'MCHP', 'CDNS', 'MSCI', 'CHTR', 'EIX', 'KDP', 'BBY', 'GEN', 'LVS', 'HCA', 'AJG', 'DTE', 'SPY_av', 'C', 'T', 'CF', 'MGM', 'HUM', 'CBOE', 'CFG', 'APH', 'SYY', 'MSI', 'FCX', 'ADM', 'LH', 'BLDR', 'LNT', 'BAC', 'PSX', 'GPN', 'HUBB', 'PPG', 'TECH', 'IRM', 'IQV', 'ESS', 'WBD', 'HAL', 'STZ', 'BG', 'ADI', 'F', 'ADBE', 'STLD', 'SMCI', 'CPRT', 'TDG', 'ULTA', 'ARE', 'SYK', 'CB', 'TSN', 'GNRC', 'PEP', 'PEG', 'NOW', 'LLY', 'COST', 'REG', 'NWS', 'LOW', 'MDLZ', 'BKNG', 'ZBRA', 'XEL', 'AIZ', 'WDAY', 'MET', 'APO', 'FTV', 'DLR', 'ACGL', 'FAST', 'TJX', 'SNA', 'MPC', 'BR', 'D', 'MRK', 'STX', 'NOC', 'BXP', 'COIN', 'KHC', 'ABNB', 'UNP', 'ALLE', 'ABBV', 'ORCL', 'ECL', 'ETR', 'EBAY', 'SBUX', 'IR', 'AMT', 'INTU', 'DPZ', 'PAYC', 'PG', 'CAT', 'ODFL', 'MCD', 'MNST', 'PSKY', 'AMZN', 'GEHC', 'EG', 'INTC', 'PNR', 'GLW', 'BDX', 'KMI', 'CSGP', 'PWR', 'APTV', 'DXCM', 'EXR', 'WELL', 'EXE', 'HOLX', 'EXPD', 'GM', 'TXN', 'VRSK', 'SJM', 'TMO', 'OXY', 'RL', 'DECK', 'CCI', 'MMM', 'MOS', 'FTNT', 'HSY', 'DHI', 'ED', 'ES', 'ADSK', 'GL', 'INVH', 'IP', 'EXPE', 'KO', 'PCAR', 'RVTY', 'WDC', 'PYPL', 'NEE', 'UPS', 'ELV', 'EMR', 'MSFT', 'CTAS', 'UDR', 'WEC', 'UBER', 'AME', 'IT', 'DD', 'ACN', 'VRSN', 'EW', 'CMG', 'AWK', 'COO', 'SHW', 'HPQ', 'AMAT', 'CCL', 'MLM', 'AVY', 'EVRG', 'EA', 'DE', 'SPG', 'AMD', 'KLAC', 'NDAQ', 'URI', 'RTX', 'NXPI', 'PNC', 'KMX', 'MTCH', 'BIIB', 'NVDA', 'CHRW', 'ROP', 'WSM', 'IDXX', 'EXC', 'HD', 'ALB', 'VLO', 'AON', 'ZTS', 'FDX', 'DG', 'TYL', 'HIG', 'CMS', 'CAG', 'INCY', 'SCHW', 'HSIC', 'AZO', 'AXP', 'HPE', 'HRL', 'SO', 'FRT', 'ZBH', 'CME', 'XOM', 'AMP', 'CVX', 'CMCSA', 'PCG', 'PNW', 'ICE', 'BEN', 'UHS', 'BKR', 'EMN', 'SBAC', 'ROK', 'PTC', 'NRG', 'NSC', 'NKE', 'FIS', 'FANG', 'XYZ', 'VTR', 'MAS', 'RF', 'AMCR', 'TAP', 'MAR', 'XYL', 'CMI', 'MTD', 'CPAY', 'KR', 'PLD', 'IBM', 'USB', 'BSX', 'LKQ', 'LIN', 'ITW', 'EOG', 'KMB', 'SPGI', 'NEM', 'LULU', 'WFC', 'CTVA', 'TTD', 'EL', 'GS', 'GD', 'CNP', 'PM', 'MCO', 'CLX', 'CAH', 'PANW', 'DELL', 'MPWR', 'DGX', 'AVB', 'DIS', 'SW', 'CBRE', 'GE', 'HII', 'LDOS', 'ALL', 'ERIE', 'ETN', 'ALGN', 'NFLX', 'LEN', 'FITB', 'WST', 'GWW', 'TRGP', 'LII', 'NTRS', 'FICO', 'AXON', 'CVS', 'AOS', 'FE', 'JPM', 'ABT', 'OMC', 'COF', 'TSCO', 'PH', 'HST', 'JBHT', 'MRNA', 'TSLA', 'MOH', 'ATO', 'COP', 'DHR', 'CNC', 'MCK', 'TXT', 'MTB', 'FDS', 'VTRS', 'AKAM', 'ROL', 'RMD', 'WRB', 'GOOGL', 'BRO', 'ANET', 'PAYX', 'DRI', 'META', 'COR', 'MAA', 'FOXA', 'POOL', 'CZR', 'FFIV', 'CRWD', 'CINF', 'VMC', 'MKTX', 'SRE', 'LHX', 'ORLY', 'IVZ', 'RCL', 'SNPS', 'GOOG', 'EPAM', 'NDSN', 'YUM', 'EQT', 'LYV', 'PFE', 'AVGO', 'DUK', 'TPL', 'REGN', 'CL', 'VZ', 'JCI', 'DAY', 'FSLR', 'AMGN', 'TEL', 'JBL', 'VST', 'JKHY', 'ADP', 'ON', 'STT', 'RSG', 'IFF', 'CARR', 'TRMB', 'QCOM', 'DASH', 'LYB', 'GIS', 'PHM', 'ROST', 'LUV', 'LW', 'MS', 'CPB', 'OKE', 'BK', 'J', 'SYF', 'CHD', 'HWM', 'MHK', 'TFC', 'DAL', 'APA', 'AFL', 'CSX', 'NI', 'CPT', 'PFG', 'NCLH', 'RJF', 'HBAN', 'UNH', 'PRU', 'PLTR', 'GPC', 'WTW', 'DDOG', 'WMB', 'EQR', 'DVA', 'AIG', 'MA', 'HON', 'VICI', 'O', 'NWSA', 'TTWO', 'AES', 'SLB', 'DOC', 'TT', 'TGT', 'AAPL', 'MKC', 'OTIS', 'CEG', 'TDY', 'WY', 'APD', 'GRMN', 'AEE', 'BX', 'HLT', 'DLTR', 'STE', 'HAS', 'TMUS', 'WMT', 'NTAP', 'KIM', 'BAX', 'LMT', 'KKR', 'KEY', 'KEYS', 'BMY', 'PSA', 'WYNN', 'EFX', 'NUE', 'PKG', 'GDDY', 'WAB', 'CTSH', 'SWK', 'CRL', 'MU', 'TRV', 'L', 'AEP', 'CI', 'DOW', 'CDW', 'BALL', 'JNJ', 'WM', 'DOV', 'CRM', 'PGR', 'WAT', 'IEX', 'LRCX', 'BLK', 'PPL']
 DB_PATH="gap_fade_trades.db"
 ET=ZoneInfo("America/New_York")
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
@@ -70,7 +72,7 @@ def get_performance_stats():
 
 class GapFadeStrategy:
     def __init__(self):
-        self.ewma_var=0.0; self.daily_returns=[]; self.portfolio_value=PAPER_CAPITAL
+        self.ewma_var=0.0; self.daily_returns=[]; self.portfolio_value=PAPER_CAPITAL; self._vol_cache={}
         self._load_state()
     def _load_state(self):
         con=get_db(); eq=pd.read_sql("SELECT * FROM equity ORDER BY date",con); con.close()
@@ -152,10 +154,28 @@ class GapFadeStrategy:
         cur.execute("""INSERT OR REPLACE INTO equity(date,portfolio_value,daily_return,sharpe,max_dd,win_rate)
         VALUES(?,?,?,?,?,?)""",(date_str,round(new_value,2),portfolio_ret,round(sharpe,4),round(max_dd,4),round(win_rate,2)))
         con.commit(); con.close()
+
+        # Place real IBKR paper trades
+        if IBKR_AVAILABLE and USE_IBKR:
+            try:
+                trader = IBKRTrader()
+                if trader.connect():
+                    capital_per_trade = new_value
+                    for s in signals:
+                        if s["weight"] == 0: continue
+                        price_est = s["open"]
+                        dollar_alloc = abs(s["weight"]) * capital_per_trade * scale
+                        qty = max(1, int(dollar_alloc / price_est))
+                        trader.place_order(s["sym"], s["direction"], qty)
+                    trader.disconnect()
+            except Exception as e:
+                log.error(f"IBKR trading error: {e}")
+
         log.info(f"Day {date_str}: ret={portfolio_ret*100:.3f}% portfolio={new_value:,.2f}"); return portfolio_ret
     def run_daily(self):
         now_et=datetime.now(ET); date_str=now_et.strftime("%Y-%m-%d")
         log.info(f"=== Running gap-fade strategy for {date_str} ===")
+        self.precompute_vols()
         data=self.fetch_data()
         if not data: return
         signals=self.generate_signals(data)
