@@ -13,7 +13,7 @@ from flask import Flask, jsonify, render_template_string
 
 GAP_THRESHOLD_BPS=15; SPREAD_BPS=1.0; IMPACT_BPS=0.5; GROSS=1.0
 MAX_WEIGHT=0.02; LOOKBACK=20; Z_MIN=0.5; Z_MAX=3.0; TOP_FRAC=0.50
-STOP_BPS=10.0; TARGET_VOL=0.06; EWMA_LAMBDA=0.97; PAPER_CAPITAL=100_000.0
+STOP_BPS=10.0; TARGET_VOL=0.06; EWMA_LAMBDA=0.97; PAPER_CAPITAL=1_000_000.0
 UNIVERSE = ['CSCO', 'UAL', 'TROW', 'ISRG', 'NVR', 'TPR', 'DVN', 'BA', 'VRTX', 'GILD', 'TKO', 'EQIX', 'TER', 'PODD', 'MDT', 'V', 'A', 'FOX', 'MO', 'CTRA', 'SWKS', 'ENPH', 'MCHP', 'CDNS', 'MSCI', 'CHTR', 'EIX', 'KDP', 'BBY', 'GEN', 'LVS', 'HCA', 'AJG', 'DTE', 'SPY_av', 'C', 'T', 'CF', 'MGM', 'HUM', 'CBOE', 'CFG', 'APH', 'SYY', 'MSI', 'FCX', 'ADM', 'LH', 'BLDR', 'LNT', 'BAC', 'PSX', 'GPN', 'HUBB', 'PPG', 'TECH', 'IRM', 'IQV', 'ESS', 'WBD', 'HAL', 'STZ', 'BG', 'ADI', 'F', 'ADBE', 'STLD', 'SMCI', 'CPRT', 'TDG', 'ULTA', 'ARE', 'SYK', 'CB', 'TSN', 'GNRC', 'PEP', 'PEG', 'NOW', 'LLY', 'COST', 'REG', 'NWS', 'LOW', 'MDLZ', 'BKNG', 'ZBRA', 'XEL', 'AIZ', 'WDAY', 'MET', 'APO', 'FTV', 'DLR', 'ACGL', 'FAST', 'TJX', 'SNA', 'MPC', 'BR', 'D', 'MRK', 'STX', 'NOC', 'BXP', 'COIN', 'KHC', 'ABNB', 'UNP', 'ALLE', 'ABBV', 'ORCL', 'ECL', 'ETR', 'EBAY', 'SBUX', 'IR', 'AMT', 'INTU', 'DPZ', 'PAYC', 'PG', 'CAT', 'ODFL', 'MCD', 'MNST', 'PSKY', 'AMZN', 'GEHC', 'EG', 'INTC', 'PNR', 'GLW', 'BDX', 'KMI', 'CSGP', 'PWR', 'APTV', 'DXCM', 'EXR', 'WELL', 'EXE', 'HOLX', 'EXPD', 'GM', 'TXN', 'VRSK', 'SJM', 'TMO', 'OXY', 'RL', 'DECK', 'CCI', 'MMM', 'MOS', 'FTNT', 'HSY', 'DHI', 'ED', 'ES', 'ADSK', 'GL', 'INVH', 'IP', 'EXPE', 'KO', 'PCAR', 'RVTY', 'WDC', 'PYPL', 'NEE', 'UPS', 'ELV', 'EMR', 'MSFT', 'CTAS', 'UDR', 'WEC', 'UBER', 'AME', 'IT', 'DD', 'ACN', 'VRSN', 'EW', 'CMG', 'AWK', 'COO', 'SHW', 'HPQ', 'AMAT', 'CCL', 'MLM', 'AVY', 'EVRG', 'EA', 'DE', 'SPG', 'AMD', 'KLAC', 'NDAQ', 'URI', 'RTX', 'NXPI', 'PNC', 'KMX', 'MTCH', 'BIIB', 'NVDA', 'CHRW', 'ROP', 'WSM', 'IDXX', 'EXC', 'HD', 'ALB', 'VLO', 'AON', 'ZTS', 'FDX', 'DG', 'TYL', 'HIG', 'CMS', 'CAG', 'INCY', 'SCHW', 'HSIC', 'AZO', 'AXP', 'HPE', 'HRL', 'SO', 'FRT', 'ZBH', 'CME', 'XOM', 'AMP', 'CVX', 'CMCSA', 'PCG', 'PNW', 'ICE', 'BEN', 'UHS', 'BKR', 'EMN', 'SBAC', 'ROK', 'PTC', 'NRG', 'NSC', 'NKE', 'FIS', 'FANG', 'XYZ', 'VTR', 'MAS', 'RF', 'AMCR', 'TAP', 'MAR', 'XYL', 'CMI', 'MTD', 'CPAY', 'KR', 'PLD', 'IBM', 'USB', 'BSX', 'LKQ', 'LIN', 'ITW', 'EOG', 'KMB', 'SPGI', 'NEM', 'LULU', 'WFC', 'CTVA', 'TTD', 'EL', 'GS', 'GD', 'CNP', 'PM', 'MCO', 'CLX', 'CAH', 'PANW', 'DELL', 'MPWR', 'DGX', 'AVB', 'DIS', 'SW', 'CBRE', 'GE', 'HII', 'LDOS', 'ALL', 'ERIE', 'ETN', 'ALGN', 'NFLX', 'LEN', 'FITB', 'WST', 'GWW', 'TRGP', 'LII', 'NTRS', 'FICO', 'AXON', 'CVS', 'AOS', 'FE', 'JPM', 'ABT', 'OMC', 'COF', 'TSCO', 'PH', 'HST', 'JBHT', 'MRNA', 'TSLA', 'MOH', 'ATO', 'COP', 'DHR', 'CNC', 'MCK', 'TXT', 'MTB', 'FDS', 'VTRS', 'AKAM', 'ROL', 'RMD', 'WRB', 'GOOGL', 'BRO', 'ANET', 'PAYX', 'DRI', 'META', 'COR', 'MAA', 'FOXA', 'POOL', 'CZR', 'FFIV', 'CRWD', 'CINF', 'VMC', 'MKTX', 'SRE', 'LHX', 'ORLY', 'IVZ', 'RCL', 'SNPS', 'GOOG', 'EPAM', 'NDSN', 'YUM', 'EQT', 'LYV', 'PFE', 'AVGO', 'DUK', 'TPL', 'REGN', 'CL', 'VZ', 'JCI', 'DAY', 'FSLR', 'AMGN', 'TEL', 'JBL', 'VST', 'JKHY', 'ADP', 'ON', 'STT', 'RSG', 'IFF', 'CARR', 'TRMB', 'QCOM', 'DASH', 'LYB', 'GIS', 'PHM', 'ROST', 'LUV', 'LW', 'MS', 'CPB', 'OKE', 'BK', 'J', 'SYF', 'CHD', 'HWM', 'MHK', 'TFC', 'DAL', 'APA', 'AFL', 'CSX', 'NI', 'CPT', 'PFG', 'NCLH', 'RJF', 'HBAN', 'UNH', 'PRU', 'PLTR', 'GPC', 'WTW', 'DDOG', 'WMB', 'EQR', 'DVA', 'AIG', 'MA', 'HON', 'VICI', 'O', 'NWSA', 'TTWO', 'AES', 'SLB', 'DOC', 'TT', 'TGT', 'AAPL', 'MKC', 'OTIS', 'CEG', 'TDY', 'WY', 'APD', 'GRMN', 'AEE', 'BX', 'HLT', 'DLTR', 'STE', 'HAS', 'TMUS', 'WMT', 'NTAP', 'KIM', 'BAX', 'LMT', 'KKR', 'KEY', 'KEYS', 'BMY', 'PSA', 'WYNN', 'EFX', 'NUE', 'PKG', 'GDDY', 'WAB', 'CTSH', 'SWK', 'CRL', 'MU', 'TRV', 'L', 'AEP', 'CI', 'DOW', 'CDW', 'BALL', 'JNJ', 'WM', 'DOV', 'CRM', 'PGR', 'WAT', 'IEX', 'LRCX', 'BLK', 'PPL']
 DB_PATH="gap_fade_trades.db"
 ET=ZoneInfo("America/New_York")
@@ -94,12 +94,26 @@ class GapFadeStrategy:
         except Exception as e: log.error(f"Data fetch error: {e}")
         log.info(f"Got data for {len(data)} symbols"); return data
     def compute_rolling_vol(self,sym,lookback=LOOKBACK):
+        return self._vol_cache.get(sym, 0.01)
+    def precompute_vols(self):
+        log.info("Pre-computing volatilities...")
         try:
-            df=yf.download(sym,period=f"{lookback+5}d",interval="1d",auto_adjust=False,progress=False)
-            if len(df)<lookback: return 0.01
-            oc=((df["Close"]-df["Open"])/df["Open"]).tail(lookback)
-            return float(oc.std()) or 0.01
-        except: return 0.01
+            import pandas as pd
+            df=yf.download(UNIVERSE,period="30d",interval="1d",auto_adjust=False,progress=False,group_by="ticker")
+            vols={}
+            for sym in UNIVERSE:
+                try:
+                    s=df[sym].dropna() if isinstance(df.columns,pd.MultiIndex) else df.dropna()
+                    if len(s)>=5:
+                        oc=((s["Close"]-s["Open"])/s["Open"])
+                        vols[sym]=float(oc.std()) or 0.01
+                except: vols[sym]=0.01
+            self._vol_cache=vols
+            log.info(f"Computed vols for {len(vols)} symbols")
+        except Exception as e:
+            log.error(f"Vol error: {e}")
+            self._vol_cache={}
+
     def generate_signals(self,data):
         threshold=GAP_THRESHOLD_BPS/10000.0; candidates=[]
         for sym,d in data.items():
